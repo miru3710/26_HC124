@@ -1,0 +1,474 @@
+/*------------------------------------------------------------------------------
+  LIDAR RC CAR  -  LIDAR-Lite v3 + motor control (Arduino UNO R4 WiFi)
+
+  Needs the Garmin LIDAR-Lite v3 library (LIDARLite.h), NOT the v3HP / v4 one.
+  Put this file in a folder named "lidar_rc_car" (folder name = sketch name).
+------------------------------------------------------------------------------*/
+
+#include <stdint.h>
+#include <Wire.h>
+#include <LIDARLite.h>
+
+LIDARLite myLidarLite;
+
+#define MonitorPin 6
+#define TriggerPin 7
+
+// ============================================================
+// LiDAR settings
+// ============================================================
+
+static const uint32_t PRINT_PERIOD_MS = 50;
+
+#define FILTER_SIZE 5
+#define MIN_VALID_CM 5
+#define MAX_VALID_CM 4000
+#define MAX_CONSECUTIVE_FAILS 5   // after this many bad reads in a row -> distance = -1
+
+static int distBuffer[FILTER_SIZE];
+static int distBufferIndex = 0;
+static bool bufferFilled = false;
+static int lastGoodDistance = -1;
+static int failCount = 0;
+
+// Latest filtered distance in cm. -1 = no valid reading (sensor problem).
+int distance = -1;
+
+int distanceFast(bool biasCorrection);
+int readFilteredDistance(bool biasCorrection);
+
+// ============================================================
+// Motor pins
+// ============================================================
+
+const int PWMA = 3;
+const int AIN1 = 9;
+const int AIN2 = 8;
+const int STBY = 10;
+
+const int BIN1 = 11;
+const int BIN2 = 12;
+const int PWMB = 5;
+
+// ============================================================
+// Driving parameters
+// ============================================================
+
+const int DRIVE_SPEED = 255;
+
+const int THRESHOLD = 70;         // stop below this (cm)
+const int START_THRESHOLD = 90;   // restart at/above this (cm)
+
+const uint32_t BRAKE_HOLD_MS = 400;
+
+// ============================================================
+// State
+// ============================================================
+
+bool isDriving = false;
+bool isBraking = false;
+
+uint32_t brakeStartMs = 0;
+
+// true  = LiDAR auto-drive active
+// false = motors stopped; LiDAR output continues
+bool motorControlEnabled = false;
+
+// ============================================================
+// Steering
+// ============================================================
+
+const int STEER_SPEED = 200;
+
+int steerTrim = 105;
+
+const int STEER_TRIM_STEP = 5;
+const int STEER_TRIM_FINE = 1;
+const int STEER_TRIM_MAX = 200;
+
+// ============================================================
+// Driver
+// ============================================================
+
+void enableDriver()  { digitalWrite(STBY, HIGH); }
+void disableDriver() { digitalWrite(STBY, LOW); }
+
+// ============================================================
+// Steering motor
+// ============================================================
+
+void setSteerMotor(int speed) {
+
+  if (speed > 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+    analogWrite(PWMB, speed);
+  }
+  else if (speed < 0) {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    analogWrite(PWMB, -speed);
+  }
+  else {
+    analogWrite(PWMB, 0);
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+  }
+}
+
+void steerLeft() {
+  enableDriver();
+  setSteerMotor(STEER_SPEED);
+}
+
+void steerRight() {
+  enableDriver();
+  setSteerMotor(-STEER_SPEED);
+}
+
+void steerCenter() {
+  setSteerMotor(0);
+}
+
+// ============================================================
+// Trim
+// ============================================================
+
+void printTrim() {
+
+  Serial.print("TRIM ");
+  Serial.print(steerTrim);
+
+  Serial.println(
+    steerTrim > 0 ? " (left)" :
+    (steerTrim < 0 ? " (right)" : " (off)")
+  );
+}
+
+void adjustTrim(int delta) {
+
+  steerTrim += delta;
+
+  if (steerTrim > STEER_TRIM_MAX)  steerTrim = STEER_TRIM_MAX;
+  if (steerTrim < -STEER_TRIM_MAX) steerTrim = -STEER_TRIM_MAX;
+
+  if (isDriving) {
+    setSteerMotor(steerTrim);
+  }
+
+  printTrim();
+}
+
+// ============================================================
+// Forward / Brake
+// ============================================================
+
+void goForward() {
+
+  enableDriver();
+
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+
+  analogWrite(PWMA, DRIVE_SPEED);
+
+  setSteerMotor(steerTrim);
+
+  isDriving = true;
+  isBraking = false;
+}
+
+void stopMotor() {
+
+  enableDriver();
+
+  // short brake
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, HIGH);
+
+  analogWrite(PWMA, 255);
+
+  setSteerMotor(0);
+
+  isDriving = false;
+  isBraking = true;
+
+  brakeStartMs = millis();
+}
+
+void releaseBrake() {
+
+  analogWrite(PWMA, 0);
+
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+
+  setSteerMotor(0);
+
+  disableDriver();
+
+  isBraking = false;
+}
+
+// ============================================================
+// Setup
+// ============================================================
+
+void setup() {
+
+  // Motor pins first, so the motors are safely off right away
+  pinMode(PWMA, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  digitalWrite(STBY, LOW);
+
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
+
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
+
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000);   // wait for UNO R4 USB serial
+
+  pinMode(MonitorPin, INPUT);
+  pinMode(TriggerPin, OUTPUT);
+  digitalWrite(TriggerPin, LOW);
+
+  Serial.println("--- LIDAR-Lite v3 Initializing ---");
+
+  // begin() starts Wire. false = keep I2C at 100 kHz (400 kHz can cause
+  // timing errors on the UNO R4). Do NOT call Wire.setClock(400000) afterwards.
+  myLidarLite.begin(0, false);
+
+  // Preset mode 2. No manual register writes after this, since they
+  // would conflict with / be overwritten by the preset.
+  myLidarLite.configure(2);
+
+  for (int i = 0; i < FILTER_SIZE; i++) {
+    distBuffer[i] = 0;
+  }
+
+  Serial.println("--- LIDAR-Lite v3 Ready ---");
+
+  Serial.println("LIDAR RC CAR");
+
+  Serial.println("SPACE = motor control ON");
+  Serial.println("s     = motor STOP");
+  Serial.println("LiDAR output continues even when stopped.");
+
+  Serial.println("l = left");
+  Serial.println("r = right");
+  Serial.println("c = center");
+
+  Serial.println("a/d = trim +-5");
+  Serial.println("q/e = trim +-1");
+  Serial.println("0 = trim off");
+
+  printTrim();
+
+  motorControlEnabled = false;
+  isDriving = false;
+  isBraking = false;
+}
+
+// ============================================================
+// Loop
+// ============================================================
+
+void loop() {
+
+  // ----------------------------------------------------------
+  // Serial commands
+  // ----------------------------------------------------------
+
+  while (Serial.available() > 0) {
+
+    char cmd = Serial.read();
+
+    if (cmd == ' ') {
+      motorControlEnabled = true;
+      Serial.println("MOTOR CONTROL ON");
+    }
+
+    if (cmd == 's') {
+      motorControlEnabled = false;
+
+      if (!isBraking) {
+        stopMotor();
+      }
+
+      Serial.println("MOTOR STOP - LiDAR still running");
+    }
+
+    if (cmd == 'l') {
+      steerLeft();
+      Serial.println("STEER LEFT");
+    }
+
+    if (cmd == 'r') {
+      steerRight();
+      Serial.println("STEER RIGHT");
+    }
+
+    if (cmd == 'c') {
+      steerCenter();
+      Serial.println("STEER CENTER");
+    }
+
+    if (cmd == 'a') adjustTrim(+STEER_TRIM_STEP);
+    if (cmd == 'd') adjustTrim(-STEER_TRIM_STEP);
+    if (cmd == 'q') adjustTrim(+STEER_TRIM_FINE);
+    if (cmd == 'e') adjustTrim(-STEER_TRIM_FINE);
+
+    if (cmd == '0') {
+      steerTrim = 0;
+      setSteerMotor(0);
+      printTrim();
+    }
+  }
+
+  // ----------------------------------------------------------
+  // LiDAR measurement (always runs, regardless of motor state)
+  // ----------------------------------------------------------
+
+  distance = readFilteredDistance(true);
+
+  uint32_t now = millis();
+
+  // ----------------------------------------------------------
+  // Serial distance output (always)
+  // ----------------------------------------------------------
+
+  static uint32_t lastPrint = 0;
+
+  if (now - lastPrint >= PRINT_PERIOD_MS) {
+    lastPrint = now;
+
+    if (distance >= 0) {
+      Serial.println(distance);
+    } else {
+      Serial.println("Error: -1 (LiDAR read failed)");
+    }
+  }
+
+  // ----------------------------------------------------------
+  // LiDAR motor control (only after SPACE)
+  // ----------------------------------------------------------
+
+  if (motorControlEnabled) {
+
+    // Fail-safe: no valid reading while driving -> brake
+    if (distance < 0 && isDriving) {
+      stopMotor();
+    }
+
+    // Closer than 70 cm -> stop
+    else if (distance > 0 && distance < THRESHOLD && isDriving) {
+      stopMotor();
+    }
+
+    // 90 cm or more -> go again
+    else if (distance >= START_THRESHOLD && !isDriving && !isBraking) {
+      goForward();
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Brake hold
+  // ----------------------------------------------------------
+
+  if (isBraking && (now - brakeStartMs >= BRAKE_HOLD_MS)) {
+    releaseBrake();
+  }
+}
+
+// ============================================================
+// Glitch rejection + moving average
+// ============================================================
+
+int readFilteredDistance(bool biasCorrection)
+{
+  int raw = distanceFast(biasCorrection);
+
+  // Failed or out-of-range reading
+  if (raw < MIN_VALID_CM || raw > MAX_VALID_CM)
+  {
+    failCount++;
+
+    // Tolerate a few isolated glitches, but report failure if it persists
+    // so the car does not keep driving on stale data.
+    if (failCount >= MAX_CONSECUTIVE_FAILS) {
+      return -1;
+    }
+    return lastGoodDistance;
+  }
+
+  failCount = 0;
+  lastGoodDistance = raw;
+
+  distBuffer[distBufferIndex] = raw;
+  distBufferIndex = (distBufferIndex + 1) % FILTER_SIZE;
+  if (distBufferIndex == 0) bufferFilled = true;
+
+  int count = bufferFilled ? FILTER_SIZE : distBufferIndex;
+  if (count == 0) return raw;
+
+  long sum = 0;
+  for (int i = 0; i < count; i++) sum += distBuffer[i];
+  return (int)(sum / count);
+}
+
+// ============================================================
+// Single distance measurement (LIDAR-Lite v3, I2C)
+// Order: trigger -> wait until not busy -> read 2 bytes from 0x8f
+// Returns distance in cm, or -1 on failure.
+// ============================================================
+
+int distanceFast(bool biasCorrection)
+{
+  // 1. Trigger a measurement
+  Wire.beginTransmission(LIDARLITE_ADDR_DEFAULT);
+  Wire.write(0x00);
+  Wire.write(biasCorrection ? 0x04 : 0x03);
+  if (Wire.endTransmission() != 0) return -1;
+
+  // 2. Wait until the busy flag (bit 0 of register 0x01) clears
+  uint32_t startMs = millis();
+
+  while (true)
+  {
+    Wire.beginTransmission(LIDARLITE_ADDR_DEFAULT);
+    Wire.write(0x01);
+    if (Wire.endTransmission() != 0) return -1;
+
+    if (Wire.requestFrom((uint8_t)LIDARLITE_ADDR_DEFAULT, (uint8_t)1) >= 1)
+    {
+      if ((Wire.read() & 0x01) == 0) break;   // not busy
+    }
+
+    if (millis() - startMs > 50) return -1;   // timeout
+  }
+
+  // 3. Read the 2-byte distance (0x8f = 0x0f with auto-increment bit)
+  Wire.beginTransmission(LIDARLITE_ADDR_DEFAULT);
+  Wire.write(0x8f);
+  if (Wire.endTransmission() != 0) return -1;
+
+  if (Wire.requestFrom((uint8_t)LIDARLITE_ADDR_DEFAULT, (uint8_t)2) < 2) return -1;
+
+  int d = Wire.read();
+  d <<= 8;
+  d |= Wire.read();
+
+  return d;
+}

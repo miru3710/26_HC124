@@ -118,12 +118,12 @@ Tx 8°\~10°는 거리 값 변화가 뚜렷하지 않아 IR 카메라로 찾은 
 
 | 구분 | 주요 담당 역할 | 보고서 및 자료 제작 |
 | :---: | :--- | :--- |
-| **김영빈 (팀장)** | 프로젝트 전체 총괄, 연구 및 개발 방향 조율, 진행 관리 | 개발보고서 중심 작성, 전체 내용 취합 및 검토 |
-| **김나영** | 실험 데이터 정리, 분석 및 고찰 | 개발보고서 중심 작성 |
-| **김민서** | 실험 데이터 정리, 분석 및 고찰 | 개발보고서 중심 작성 |
-| **곽민상** | RC 차량 제어, Unity 시뮬레이션 개발 | 제작설계서 중심 작성 |
-| **문근휘** | 프로젝트 자료 정리, 소개 및 시연 영상 제작 | 제작설계서 중심 작성 |
-| **박정현** | LiDAR 기술 자문, 실험 해석 검토 | - |
+| **멘티1** | 프로젝트 전체 총괄, 연구 및 개발 방향 조율, 진행 관리 | 개발보고서 중심 작성, 전체 내용 취합 및 검토 |
+| **멘티2** | 실험 데이터 정리, 분석 및 고찰 | 개발보고서 중심 작성 |
+| **멘티3** | 실험 데이터 정리, 분석 및 고찰 | 개발보고서 중심 작성 |
+| **멘티4** | RC 차량 제어, Unity 시뮬레이션 개발 | 제작설계서 중심 작성 |
+| **멘티5** | 프로젝트 자료 정리, 소개 및 시연 영상 제작 | 제작설계서 중심 작성 |
+| **멘티6** | LiDAR 기술 자문, 실험 해석 검토 | - |
 
 > 개발보고서와 제작설계서는 팀원 전원이 함께 작성했고, 표에는 각자의 주요 담당 업무를 적었다.
 
@@ -204,32 +204,197 @@ flowchart TD
 
 **5-1. LiDAR 거리 측정**
 
-- **소스코드 설명** : takeRange()로 측정을 시작하면 LiDAR 상태 레지스터(0x01)의 busy flag가 1이 되고, 측정이 끝나면 0으로 돌아온다. flag가 0이 된 뒤에 거리 레지스터(0x10, 0x11)를 읽어야 직전 측정값이 아니라 이번 측정값을 얻는다.
+- **소스코드 설명** : LiDAR-Lite v3를 I2C로 트리거하고, busyflag가 풀리면 2byte 거리값(cm)를 읽는다.
 
 ```cpp
-myLidar.takeRange();                          // 측정 시작
-while (myLidar.getBusyFlag()) { }             // busy flag가 0이 될 때까지 대기
-uint16_t distance = myLidar.readDistance();   // 이번 측정의 거리 (cm)
-Serial.println(distance);
+int distanceFast(bool biasCorrection)
+{
+  Wire.beginTransmission(LIDARLITE_ADDR_DEFAULT);
+  Wire.write(0x00);
+  Wire.write(biasCorrection ? 0x04 : 0x03);
+  if (Wire.endTransmission() != 0) return -1;
+  while (true)
+  {
+    Wire.beginTransmission(LIDARLITE_ADDR_DEFAULT);
+    Wire.write(0x01);
+    if (Wire.endTransmission() != 0) return -1;
+    if (Wire.requestFrom((uint8_t)LIDARLITE_ADDR_DEFAULT, (uint8_t)1) >= 1)
+    {
+      if ((Wire.read() & 0x01) == 0) break;   // not busy
+    }
+    if (millis() - startMs > 50) return -1;   // timeout
+  }
+  Wire.beginTransmission(LIDARLITE_ADDR_DEFAULT);
+  Wire.write(0x8f);
+  if (Wire.endTransmission() != 0) return -1;
+  if (Wire.requestFrom((uint8_t)LIDARLITE_ADDR_DEFAULT, (uint8_t)2) < 2) return -1;
+  int d = Wire.read();
+  d <<= 8;
+  d |= Wire.read();
+  return d;
+}
 ```
 
-**5-2. 거리 기반 정지와 재출발**
+**5-2. 노이즈 필터링**
 
-- **소스코드 설명** : 임계값이 하나뿐이면 정지 직후 측정값이 잡음과 차량 진동 때문에 임계값 위아래를 오가면서 정지와 출발이 번갈아 실행된다. 정지는 50 cm 미만, 재출발은 70 cm 이상으로 기준을 나누면 측정값이 두 기준 사이에 있는 동안 직전 상태(isStopped)가 유지되어 반복 전환이 생기지 않는다.
+- **소스코드 설명** : 5~4000cm 밖의 값은 버리고, 최근 5개 값의 이동평균을 내며, 5회 연속 실패하면 -1을 반환한다.
 
 ```cpp
-const int STOP_THRESHOLD = 50;   // 정지 임계거리 (cm)
-const int GO_THRESHOLD   = 70;   // 재출발 임계거리 (cm)
-bool isStopped = false;
-
-void controlVehicle(int distance) {
-  if (!isStopped && distance < STOP_THRESHOLD) {
-    stopVehicle();               // Motor Driver 정지 신호
-    isStopped = true;
+#define FILTER_SIZE 5
+#define MIN_VALID_CM 5
+#define MAX_VALID_CM 4000
+#define MAX_CONSECUTIVE_FAILS 5
+int readFilteredDistance(bool biasCorrection)
+{
+  int raw = distanceFast(biasCorrection);
+  if (raw < MIN_VALID_CM || raw > MAX_VALID_CM)
+  {
+    failCount++;
+    if (failCount >= MAX_CONSECUTIVE_FAILS) {
+      return -1;
+    }
+    return lastGoodDistance;
   }
-  else if (isStopped && distance >= GO_THRESHOLD) {
-    driveVehicle();              // 주행 재개
-    isStopped = false;
+  failCount = 0;
+  lastGoodDistance = raw;
+  distBuffer[distBufferIndex] = raw;
+  distBufferIndex = (distBufferIndex + 1) % FILTER_SIZE;
+  if (distBufferIndex == 0) bufferFilled = true;
+  int count = bufferFilled ? FILTER_SIZE : distBufferIndex;
+  if (count == 0) return raw;
+  long sum = 0;
+  for (int i = 0; i < count; i++) sum += distBuffer[i];
+  return (int)(sum / count);
+}
+```
+**5-3. 자동 정지/재출발**
+- **소스코드 설명** : 70cm 미만이면 정지하고 90cm 이상이면 다시 출발한다. 두 기준값의 간격(히스테리시스)으로 정지와 출발이 떨리는 걸 막는다.
+```cpp
+const int THRESHOLD = 70;        
+const int START_THRESHOLD = 90;  
+if (distance > 0 && distance < THRESHOLD && isDriving) {
+  stopMotor();
+}
+else if (distance >= START_THRESHOLD && !isDriving && !isBraking) {
+  goForward();
+}
+```
+**5-4. 페일세이프**
+- **소스코드 설명** : 주행 중 유효한 측정값이 없으면 즉시 브레이크를 건다.
+```cpp
+if (distance < 0 && isDriving) {
+  stopMotor();
+}
+```
+**5-5. 단락 브레이크**
+- **소스코드 설명** : 정지할 때 모터를 단락 제동하고, 400ms 유지한 뒤 드라이버를 끈다.
+```cpp
+const uint32_t BRAKE_HOLD_MS = 400;
+
+void stopMotor() {
+  enableDriver();
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, HIGH);
+  analogWrite(PWMA, 255);
+  setSteerMotor(0);
+  isDriving = false;
+  isBraking = true;
+  brakeStartMs = millis();
+}
+void releaseBrake() {
+  analogWrite(PWMA, 0);
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+  setSteerMotor(0);
+  disableDriver();
+  isBraking = false;
+}
+if (isBraking && (now - brakeStartMs >= BRAKE_HOLD_MS)) {
+  releaseBrake();
+}
+```
+**5-6. 조향 Trim 보정**
+- **소스코드 설명** : l, r, c 명령으로 좌/우/중앙 조향을 직접 조작한다. 이를 통해 코드 외부적 사항으로 인한 tilt에 대응한다.
+```cpp
+const int STEER_SPEED = 200;
+void setSteerMotor(int speed) {
+  if (speed > 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+    analogWrite(PWMB, speed);
+  }
+  else if (speed < 0) {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    analogWrite(PWMB, -speed);
+  }
+  else {
+    analogWrite(PWMB, 0);
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+  }
+}
+void steerLeft()   {
+enableDriver(); setSteerMotor(STEER_SPEED); }
+void steerRight()  { enableDriver(); setSteerMotor(-STEER_SPEED); }
+void steerCenter() { setSteerMotor(0); }
+int steerTrim = 105;
+const int STEER_TRIM_STEP = 5;
+const int STEER_TRIM_FINE = 1;
+const int STEER_TRIM_MAX = 200;
+void adjustTrim(int delta) {
+  steerTrim += delta;
+  if (steerTrim > STEER_TRIM_MAX)  steerTrim = STEER_TRIM_MAX;
+  if (steerTrim < -STEER_TRIM_MAX) steerTrim = -STEER_TRIM_MAX;
+  if (isDriving) {
+    setSteerMotor(steerTrim);
+  }
+  printTrim();
+}
+if (cmd == 'a') adjustTrim(+STEER_TRIM_STEP);
+if (cmd == 'd') adjustTrim(-STEER_TRIM_STEP);
+if (cmd == 'q') adjustTrim(+STEER_TRIM_FINE);
+if (cmd == 'e') adjustTrim(-STEER_TRIM_FINE);
+if (cmd == '0') {
+  steerTrim = 0;
+  setSteerMotor(0);
+  printTrim();
+}
+```
+**5-7. 시리얼 모터 제어**
+- **소스코드 설명** : Space로 자동주행을 켜고 필요 시 s로 정지한다. 정지 상태에서도 LiDAR는 계속 동작한다.
+```cpp
+
+bool motorControlEnabled = false;
+while (Serial.available() > 0) {
+  char cmd = Serial.read();
+  if (cmd == ' ') {
+    motorControlEnabled = true;
+    Serial.println("MOTOR CONTROL ON");
+  }
+  if (cmd == 's') {
+    motorControlEnabled = false;
+    if (!isBraking) {
+      stopMotor();
+    }
+    Serial.println("MOTOR STOP - LiDAR still running");
+  }
+}
+```
+**5-8. 거리 시리얼 출력**
+- **소스코드 설명** : 모터 상태와 관계없이 50ms마다 현재 거리를 출력하고, 측정이 실패하면 에러 메시지를 출력한다.
+```cpp
+static const uint32_t PRINT_PERIOD_MS = 50;
+// in loop()
+distance = readFilteredDistance(true);
+uint32_t now = millis();
+static uint32_t lastPrint = 0;
+if (now - lastPrint >= PRINT_PERIOD_MS) {
+  lastPrint = now;
+  if (distance >= 0) {
+    Serial.println(distance);
+  } else {
+    Serial.println("Error: -1 (LiDAR read failed)");
   }
 }
 ```

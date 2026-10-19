@@ -212,9 +212,9 @@ flowchart TD
 **3-6. AI 객체 인식 및 시각화**
 
 <p align="center">
-  <img src="images/unity_hud.jpg" width="420" alt="Unity 기반 가상 LiDAR 및 HUD 시각화 화면">
+  <img width="2353" height="1217" alt="Image" src="https://github.com/user-attachments/assets/21634779-9265-4289-8e61-d798d84fdf08" />
 </p>
-<p align="center"><sub>Unity 안의 가상 LiDAR(Ray)가 보행자를 감지하면 로그가 '감지됨'으로 바뀌고 윈드실드 HUD에 경고가 표시된다.</sub></p>
+<p align="center"><sub>Unity 기반 가상 LiDAR 및 HUD 시각화 화면 ,Unity 안의 가상 LiDAR(Ray)가 보행자를 감지하면 로그가 '감지됨'으로 바뀌고 윈드실드 HUD에 경고가 표시된다.</sub></p>
 
 YOLO 객체 인식과 Unity 시각화는 각각 단독으로 동작한다. 후속 개발에서는 YOLO 검출 결과와 LiDAR 거리의 시간과 좌표를 맞추고 Unity에 실제 측정 데이터를 표시해, **어떤 객체가 어느 방향에 얼마나 가까이 있는지** 판단하도록 확장한다.
 

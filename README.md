@@ -108,7 +108,7 @@ BD-LiDAR 융합 기반 자율주행차량 사각지대 해소 및 능동형 AI �
 **3-2. 제작한 RC 차량**
 
 <p align="center">
-  <img src="images/prototype.jpg" width="720" alt="BD-LiDAR RC 차량 프로토타입">
+  <img width="1592" height="1278" alt="Image" src="https://github.com/user-attachments/assets/b0f9b5e3-82b7-4990-a3ea-3dc356a139ea" />
 </p>
 
 **3-3. 동작 흐름**

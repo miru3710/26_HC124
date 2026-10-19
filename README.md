@@ -46,8 +46,7 @@ BD-LiDAR 융합 기반 자율주행차량 사각지대 해소 및 능동형 AI �
 
 </details>
 
-<p align="center">
-  <img src="images/txrx_setup.jpg" width="620" alt="LiDAR 송신부와 수신부의 BD 배치 및 실험 구성">
+<img width="833" height="362" alt="Image" src="https://github.com/user-attachments/assets/b3416481-c3d2-4b21-9938-5c7d3f6e6716" />
 </p>
 <p align="center"><sub>Tx와 Rx 앞에 BD를 하나씩 배치한 실험 구성</sub></p>
 

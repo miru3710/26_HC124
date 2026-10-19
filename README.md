@@ -16,6 +16,8 @@ BD-LiDAR 융합 기반 자율주행차량 사각지대 해소 및 능동형 AI �
 
 <p align="center">
   <img src="images/concept.png" width="680" alt="BD 적용 전후 LiDAR 검출 범위 비교">
+  <img width="1374" height="920" alt="Image" src="https://github.com/user-attachments/assets/5a8fda7e-4a2c-4fe3-9747-7bf69dc52811" />
+
 </p>
 <p align="center"><sub>LiDAR만 쓸 때와 BD를 붙였을 때의 검출 범위 비교 개념도</sub></p>
 
